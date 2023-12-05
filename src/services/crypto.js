@@ -14,6 +14,9 @@ function getTag(encrypted) {
 	return encrypted.slice(encrypted.byteLength - ((128 + 7) >> 3))
 }
 
+/**
+ * @return {Promise<CryptoKey>}
+ */
 export async function getRandomAESKey() {
 	return await window.crypto.subtle.generateKey(
 		{
@@ -26,9 +29,25 @@ export async function getRandomAESKey() {
 }
 
 /**
+ * @typedef {object} EncryptionParams
+ * @property {CryptoKey} key - Encryption key of the file (ex: "jtboLmgGR1OQf2uneqCVHpklQLlIwWL5TXAQ0keK")
+ * @property {Uint8Array} initializationVector - Mimetype, if unknown use "application/octet-stream" (ex: "plain/text")
+ */
+
+/**
+ * @return {Promise<EncryptionParams>}
+ */
+export async function getRandomEncryptionParams() {
+	return {
+		key: await getRandomAESKey(),
+		initializationVector: window.crypto.getRandomValues(new Uint8Array(16)),
+	}
+}
+
+/**
  * Encrypt file content
  *
- * @param {{key: CryptoKey, initializationVector: Uint8Array}} encryptionData
+ * @param {EncryptionParams} encryptionData
  * @param {Uint8Array} content
  * @return {Promise<{content: ArrayBuffer, tag: ArrayBuffer}>}
  */

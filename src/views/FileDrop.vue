@@ -18,9 +18,9 @@
 						:class="{ loading }">
 						{{ t('end_to_end_encryption', 'Select or drop files') }}
 						<input type="file"
-							multiple="multiple"
+							:multiple="true"
 							:disabled="loading"
-							@change="filesChange($event.target.files)">
+							@change="filesChange($event.target?.files)">
 					</label>
 				</div>
 
@@ -51,10 +51,10 @@ import { showError } from '@nextcloud/dialogs'
 import { translate } from '@nextcloud/l10n'
 
 import logger from '../services/logger.js'
-import { EncryptedFile } from '../services/crypto.js'
+import { EncryptedFile, encryptStringAsymmetric, encryptWithAES, getRandomEncryptionParams } from '../services/crypto.js'
 import { uploadFile } from '../services/uploadFile.js'
 import { lock, unlock } from '../services/lock.js'
-import { getFileDropEntry, uploadFileDrop } from '../services/filedrop.js'
+import { bufferToBase64, getFileDropEntry, uploadFileDrop } from '../services/filedrop.js'
 
 /**
  * @readonly
@@ -75,7 +75,7 @@ const UploadStep = {
  * @property {File} file
  * @property {UploadStep} step
  * @property {boolean} error
- * @property {Object<string, import('../services/filedrop.js').EncryptedFileMetadata>} fileDrop
+ * @property {Object<string, import('../services/filedrop.js').FileMetadata>} fileDrop
  */
 
 export default {
@@ -94,10 +94,10 @@ export default {
 			/** @type {number} */
 			folderId: loadState('end_to_end_encryption', 'fileId'),
 			/** @type {string} */
-			publicKey: loadState('end_to_end_encryption', 'publicKey'),
+			publicKeys: loadState('end_to_end_encryption', 'publicKeys'),
 			/** @type {string} */
 			fileName: loadState('end_to_end_encryption', 'fileName'),
-			/** @type {"v1"|"v2"} */
+			/** @type {1|2} */
 			encryptionVersion: Number.parseInt(loadState('end_to_end_encryption', 'encryptionVersion')),
 			/** @type {number} */
 			counter: Number.parseInt(loadState('end_to_end_encryption', 'counter')),
@@ -114,7 +114,7 @@ export default {
 		 * @param {DragEvent} event
 		 */
 		handleDragOver(event) {
-			if (!event.dataTransfer.types.includes('Files')) {
+			if (!event.dataTransfer?.types.includes('Files')) {
 				return
 			}
 
@@ -126,7 +126,7 @@ export default {
 		 * @param {DragEvent} event
 		 */
 		handleDrop(event) {
-			if (!event.dataTransfer.types.includes('Files')) {
+			if (!event.dataTransfer?.types.includes('Files')) {
 				return
 			}
 
@@ -135,10 +135,10 @@ export default {
 		},
 
 		/**
-		 * @param {FileList} fileList
+		 * @param {FileList?} fileList
 		 */
 		async filesChange(fileList) {
-			if (!fileList.length) {
+			if (!fileList?.length) {
 				return
 			}
 
@@ -146,17 +146,20 @@ export default {
 				return
 			}
 
+			const randomEncryptionParams = await getRandomEncryptionParams()
+			logger.debug('[FileDrop] Random encryption key created', { randomEncryptionParams, rawKey: bufferToBase64(await window.crypto.subtle.exportKey('raw', randomEncryptionParams.key)) })
+
 			this.loading = true
 			/** @type {UploadProgress[]} */
 			let progresses = []
 			let lockToken = null
 
 			try {
-				logger.debug('Locking the folder', { lockToken: this.lockToken, shareToken: this.shareToken })
 				lockToken = await lock(this.encryptionVersion, this.counter + 1, this.folderId, this.shareToken)
+				logger.debug(`[FileDrop] Folder locked: ${lockToken}`)
 			} catch (exception) {
-				logger.error('Could not lock the folder', { exception })
-				showError(t('end_to_end_encryption', 'Could not lock the folder'))
+				logger.error('[FileDrop] Could not lock the folder', { exception })
+				showError(this.t('end_to_end_encryption', 'Could not lock the folder'))
 				this.loading = false
 				return
 			}
@@ -167,14 +170,14 @@ export default {
 						.from(fileList)
 						.map((file) => this.uploadFile(file))
 				)
+				logger.debug('[FileDrop] Files uploaded', { progresses })
 			} catch (exception) {
-				logger.error('Error while uploading files', { exception })
-				showError(t('end_to_end_encryption', 'Error while uploading files'))
+				logger.error('[FileDrop] Error while uploading files', { exception })
+				showError(this.t('end_to_end_encryption', 'Error while uploading files'))
 				progresses.forEach(progress => { progress.error = true })
 			}
 
 			try {
-				logger.debug('Updating the fileDrop entries', { lockToken, shareToken: this.shareToken })
 				progresses
 					.filter(({ error }) => !error)
 					.forEach(progress => { progress.step = UploadStep.UPLOADING_METADATA })
@@ -183,10 +186,20 @@ export default {
 					.filter(({ error }) => !error)
 					.reduce((fileDropEntries, { fileDrop }) => ({ ...fileDropEntries, ...fileDrop }), {})
 
-				await uploadFileDrop(this.encryptionVersion, this.folderId, fileDrops, lockToken, this.shareToken)
+				logger.debug('[FileDrop] FileDrop entries computed', { fileDrops })
+
+				const { tag, content } = await this.encryptFileDropEntries(fileDrops, randomEncryptionParams)
+				const payload = {
+					ciphertext: content,
+					nonce: bufferToBase64(randomEncryptionParams.initializationVector),
+					authenticationTag: bufferToBase64(tag),
+					users: await this.encryptRandomKeyForUsers(this.publicKeys, randomEncryptionParams),
+				}
+
+				await uploadFileDrop(this.encryptionVersion, this.folderId, payload, lockToken, this.shareToken)
 			} catch (exception) {
-				logger.error('Error while uploading metadata', { exception })
-				showError(t('end_to_end_encryption', 'Error while uploading metadata'))
+				logger.error('[FileDrop] Error while uploading metadata', { exception })
+				showError(this.t('end_to_end_encryption', 'Error while uploading metadata'))
 				progresses.forEach(progress => { progress.error = true })
 			}
 
@@ -196,13 +209,13 @@ export default {
 					.forEach(progress => { progress.step = UploadStep.UNLOCKING })
 				await unlock(this.encryptionVersion, this.folderId, lockToken, this.shareToken)
 				this.counter++
-				logger.debug('Unlocking the folder', { lockToken, shareToken: this.shareToken })
+				logger.debug('[FileDrop] Folder unlocked', { lockToken, shareToken: this.shareToken })
 				progresses
 					.filter(({ error }) => !error)
 					.forEach(progress => { progress.step = UploadStep.DONE })
 			} catch (exception) {
-				logger.error('Error while unlocking the folder', { exception })
-				showError(t('end_to_end_encryption', 'Error while unlocking the folder'))
+				logger.error('[FileDrop] Error while unlocking the folder', { exception })
+				showError(this.t('end_to_end_encryption', 'Error while unlocking the folder'))
 				progresses.forEach(progress => { progress.error = true })
 			}
 
@@ -215,28 +228,91 @@ export default {
 		 */
 		async uploadFile(unencryptedFile) {
 			/** @type {UploadProgress} */
-			const progress = { file: unencryptedFile, step: UploadStep.NONE, error: false, fileDrop: undefined }
+			const progress = { file: unencryptedFile, step: UploadStep.NONE, error: false, fileDrop: {} }
 			this.uploadedFiles.push(progress)
 
 			try {
 				progress.step = UploadStep.ENCRYPTING
-				logger.debug('Encrypting the file', { unencryptedFile, shareToken: this.shareToken })
 				const file = new EncryptedFile(unencryptedFile.name, unencryptedFile.type)
 				const blob = await unencryptedFile.arrayBuffer()
-				const { content, tag } = await file.encrypt(blob)
+				const { content, tag } = await file.encrypt(new Uint8Array(blob))
+				logger.debug(`[FileDrop] File encrypted: ${unencryptedFile.name}`, { unencryptedFile, file, content, tag })
 
-				progress.fileDrop = await getFileDropEntry(file, tag, this.publicKey)
+				progress.fileDrop = await getFileDropEntry(file, new Uint8Array(tag))
 
 				progress.step = UploadStep.UPLOADING
-				logger.debug('Uploading the file', { unencryptedFile, shareToken: this.shareToken })
 				await uploadFile('/public.php/webdav/', file.encryptedFileName, content, this.shareToken)
 				progress.step = UploadStep.UPLOADED
+				logger.debug(`[FileDrop] File uploaded: ${unencryptedFile.name}`, { unencryptedFile, file, shareToken: this.shareToken })
 			} catch (exception) {
 				progress.error = true
-				logger.error(`Fail to upload the file (${progress.step})`, { exception })
+				logger.error(`[FileDrop] Fail to upload the file (${progress.step})`, { exception })
 			}
 
 			return progress
+		},
+
+		/**
+		 * @param {import('../services/filedrop.js').FileMetadata[]} fileDropEntries
+		 * @param {import('../services/crypto.js').EncryptionParams} encryptionParams
+		 */
+		async encryptFileDropEntries(fileDropEntries, encryptionParams) {
+			const compressedFileDropEntries = await this.compress(JSON.stringify(fileDropEntries))
+			logger.debug('[FileDrop] FileDrop entries compressed', { compressedFileDropEntries })
+
+			const { content, tag } = await encryptWithAES(
+				encryptionParams,
+				compressedFileDropEntries,
+			)
+			logger.debug('[FileDrop] FileDrop entries encrypted', { content, tag, encryptionParams })
+			logger.debug('[FileDrop] Cipher text base64ed', { ciphertext: bufferToBase64(content) })
+
+			return { content: bufferToBase64(content), tag }
+		},
+
+		/**
+		 * @param {string} str
+		 * @return {Promise<ArrayBuffer>}
+		 */
+		async compress(str) {
+			const stream = new Blob([str]).stream()
+			const compressedStream = stream.pipeThrough(
+				new CompressionStream('gzip'),
+			)
+
+			const chunks = []
+			const reader = compressedStream.getReader()
+
+			while (true) {
+				const { value } = await reader.read()
+				if (value === undefined) {
+					break
+				}
+				chunks.push(value)
+			}
+
+			return new Uint8Array(await new Blob(chunks).arrayBuffer())
+		},
+
+		/**
+		 * @param {Object<string, string>} usersPublicKeys
+		 * @param {import('../services/crypto.js').EncryptionParams} encryptionParams
+		 * @return {Promise<import('../services/filedrop.js').UserEncryptionInformation[]>}
+		 */
+		async encryptRandomKeyForUsers(usersPublicKeys, encryptionParams) {
+			return Promise.all(Object.entries(usersPublicKeys).map(async ([userId, publicKey]) => {
+				const rawKey = await window.crypto.subtle.exportKey('raw', encryptionParams.key)
+				const base64Key1 = bufferToBase64(rawKey)
+				const base64Key2 = btoa(base64Key1)
+				const bufferKey = new TextEncoder().encode(base64Key2)
+
+				const encryptedFileDropKey = await encryptStringAsymmetric(
+					publicKey,
+					bufferKey,
+				)
+
+				return { userId, encryptedFiledropKey: bufferToBase64(encryptedFileDropKey) }
+			}))
 		},
 
 		t: translate,

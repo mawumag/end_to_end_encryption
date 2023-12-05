@@ -240,7 +240,9 @@ class MetaDataController extends OCSController {
 			$metaData = $this->metaDataStorage->getMetaData($ownerId, $id);
 			$decodedMetadata = json_decode($metaData, true);
 			$decodedFileDrop = json_decode($fileDrop, true);
-			$decodedMetadata['filedrop'] = array_merge($decodedMetadata['filedrop'] ?? [], $decodedFileDrop);
+			$decodedMetadata['filedrop'] = $decodedFileDrop;
+			// TODO: uncomment when we support more than one file drop
+			// $decodedMetadata['filedrop'] = array_push($decodedMetadata['filedrop'] ?? [], $decodedFileDrop);
 			$encodedMetadata = json_encode($decodedMetadata);
 
 			$this->metaDataStorage->updateMetaDataIntoIntermediateFile($ownerId, $id, $encodedMetadata, $e2eToken);
@@ -253,7 +255,7 @@ class MetaDataController extends OCSController {
 			throw new OCSBadRequestException($this->l10n->t('Cannot update filedrop'));
 		}
 
-		return new DataResponse(['meta-data' => $metaData]);
+		return new DataResponse();
 	}
 
 	private function getOwnerId(?string $shareToken = null): string {
